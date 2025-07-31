@@ -1,0 +1,14 @@
+hip-fryer
+Copyright 2025 Hunter Wigelsworth
+
+This project contains code derived from gpu-fryer:
+Copyright 2025 Hugging Face
+Licensed under the Apache License, Version 2.0
+
+The original gpu-fryer project can be found at: https://github.com/huggingface/gpu-fryer
+
+Modifications made:
+
+- Adapted for AMD GPUs and ROCm ecosystem
+- Updated dependencies and error handling
+- Modified memory management for HIP APIs
