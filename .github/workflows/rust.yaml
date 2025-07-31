@@ -10,6 +10,7 @@ permissions:
 jobs:
   fmt:
     name: Rustfmt
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -20,6 +21,7 @@ jobs:
 
   clippy:
     name: Clippy
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
