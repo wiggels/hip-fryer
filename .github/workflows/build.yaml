@@ -2,9 +2,11 @@ name: Build and push docker image to registry
 
 on:
   workflow_call:
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-build
   cancel-in-progress: true
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
@@ -14,21 +16,23 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
       - name: Inject slug/short variables
         uses: rlespinasse/github-slug-action@v4.4.1
+
       - name: Initialize Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
           install: true
-          buildkitd-config: /tmp/buildkitd.toml
+
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # If pull request
-      - name: Extract metadata (tags, labels) for Docker
+
+      - name: Extract metadata (tags, labels) for Docker (PR)
         if: ${{ github.event_name == 'pull_request' }}
         id: meta-pr
         uses: docker/metadata-action@v5
@@ -37,8 +41,8 @@ jobs:
             ghcr.io/wiggels/hip-fryer
           tags: |
             type=raw,value=sha-${{ env.GITHUB_SHA_SHORT }}
-      # If master, release or tag
-      - name: Extract metadata (tags, labels) for Docker
+
+      - name: Extract metadata (tags, labels) for Docker (Main/Release)
         if: ${{ github.event_name != 'pull_request' }}
         id: meta
         uses: docker/metadata-action@v4.3.0
@@ -52,6 +56,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
             type=raw,value=sha-${{ env.GITHUB_SHA_SHORT }}
+
       - name: Build and push Docker image
         id: build-and-push
         uses: docker/build-push-action@v4
@@ -59,7 +64,7 @@ jobs:
           context: .
           file: ${{ env.DOCKERFILE }}
           push: true
-          platforms: 'linux/amd64'
+          platforms: linux/amd64
           build-args: |
             GIT_SHA=${{ env.GITHUB_SHA }}
             DOCKER_LABEL=sha-${{ env.GITHUB_SHA_SHORT }}
