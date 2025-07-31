@@ -20,11 +20,9 @@ use float8::F8E4M3;
 use rand::rngs::SmallRng;
 use rand::{RngCore, SeedableRng, rng};
 use rocm_rs::hip::bindings::{
-    hipDeviceAttribute_t, hipDeviceAttribute_t_hipDeviceAttributeComputeCapabilityMajor,
-    hipDeviceAttribute_t_hipDeviceAttributeComputeCapabilityMinor, hipDeviceGetAttribute,
-    hipDeviceProp_tR0600, hipDeviceptr_t, hipError_t_hipSuccess, hipFree, hipGetDeviceCount,
-    hipGetDevicePropertiesR0600, hipInit, hipMalloc, hipMemGetInfo, hipMemcpyHtoD, hipMemset,
-    hipSetDevice, hipStreamSynchronize,
+    hipDeviceAttribute_t, hipDeviceGetAttribute, hipDeviceProp_tR0600, hipDeviceptr_t,
+    hipError_t_hipSuccess, hipFree, hipGetDeviceCount, hipGetDevicePropertiesR0600, hipInit,
+    hipMalloc, hipMemGetInfo, hipMemcpyHtoD, hipMemset, hipSetDevice, hipStreamSynchronize,
 };
 use rocm_rs::rocblas::ffi::{
     rocblas_create_handle, rocblas_datatype__rocblas_datatype_bf16_r,
@@ -462,7 +460,7 @@ impl RocBlasHandle {
         }
     }
 
-    // FP8 GEMM - placeholder implementation since ROCm may not have native FP8 GEMM support yet
+    // FP8 GEMM - placeholder implementation because we need to use hipBLASLt
     pub fn gemm_ex_fp8(
         &self,
         _params: &GemmParams,
@@ -472,8 +470,7 @@ impl RocBlasHandle {
         _beta: &F8E4M3,
         _c: &mut HipSlice<F8E4M3>,
     ) -> anyhow::Result<()> {
-        // For now, we'll return an error as FP8 GEMM may not be directly supported
-        // In practice, you would need to check if your ROCm version supports FP8 operations
+        // For now, we'll return an error
         Err(anyhow::anyhow!(
             "FP8 GEMM not yet supported in this ROCBlas version"
         ))
@@ -589,7 +586,7 @@ impl VariablePrecisionFloat for F8E4M3 {
 }
 
 pub struct RocmSmiWrapper {
-    _smi: RocmSmi, // keep the SMI instance alive (marked with underscore to indicate intentional unused)
+    _smi: RocmSmi, // keep the SMI instance alive
     devices: Vec<Option<RocmSmiDevice>>,
     device_count: u32,
 }
@@ -890,13 +887,18 @@ fn categorize_throttle_status(status: ThrottleStatus) -> (bool, bool, bool) {
 }
 
 fn supports_bf16(gpu: &Arc<HipContext>) -> anyhow::Result<bool> {
-    // Check if GPU supports BF16 - MI325x should support it
-    let major = gpu.get_attribute(hipDeviceAttribute_t_hipDeviceAttributeComputeCapabilityMajor)?;
-    let minor = gpu.get_attribute(hipDeviceAttribute_t_hipDeviceAttributeComputeCapabilityMinor)?;
+    let name = gpu.name().to_lowercase();
 
-    // AMD MI325x is based on CDNA3 architecture which supports BF16
-    // For CDNA3 (gfx942), we can assume BF16 support
-    Ok(major >= 9 || (major == 8 && minor >= 0))
+    // Name-based detection for known BF16-supporting GPUs
+    if name.contains("mi300")
+        || name.contains("mi325")
+        || name.contains("mi250")
+        || name.contains("mi210")
+    {
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 fn supports_fp8(_gpu: &Arc<HipContext>) -> anyhow::Result<bool> {

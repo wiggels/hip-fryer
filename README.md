@@ -8,7 +8,7 @@ Use Docker:
 
 ```bash
 # You need a system with AMD GPUs
-docker run --privileged ghcr.io/wiggels/hip-fryer:0.1.0 60
+docker run --privileged ghcr.io/wiggels/hip-fryer:0.1.1 60
 ```
 
 ## Features
