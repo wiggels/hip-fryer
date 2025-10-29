@@ -1,4 +1,4 @@
-FROM rocm/dev-ubuntu-24.04:latest
+FROM rocm/dev-ubuntu-24.04:7.0.2
 
 RUN apt-get update && apt-get install -y \
     curl \
