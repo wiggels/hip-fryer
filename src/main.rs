@@ -20,8 +20,8 @@ mod sys;
 use clap::{Parser, ValueEnum};
 use rocm_smi_lib::{RocmSmi, RocmSmiDevice, RsmiTemperatureMetric, RsmiTemperatureType};
 use std::ffi::c_void;
-use std::ptr;
 use std::os::fd::RawFd;
+use std::ptr;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Barrier, Mutex, OnceLock};
@@ -418,7 +418,11 @@ impl MatmulDesc {
         }
     }
 
-    fn set_i32(&self, attr: sys::hipblasLtMatmulDescAttributes_t, value: i32) -> anyhow::Result<()> {
+    fn set_i32(
+        &self,
+        attr: sys::hipblasLtMatmulDescAttributes_t,
+        value: i32,
+    ) -> anyhow::Result<()> {
         unsafe {
             lt_check(
                 sys::hipblasLtMatmulDescSetAttribute(
@@ -507,8 +511,7 @@ pub struct RocmSmiWrapper {
 
 impl RocmSmiWrapper {
     pub fn new() -> anyhow::Result<Self> {
-        let smi =
-            RocmSmi::init().map_err(|e| anyhow::anyhow!("Failed to init ROCm SMI: {e:?}"))?;
+        let smi = RocmSmi::init().map_err(|e| anyhow::anyhow!("Failed to init ROCm SMI: {e:?}"))?;
         let mut devices = Vec::new();
         let mut device_count = 0u32;
         for i in 0..16 {
@@ -1032,7 +1035,10 @@ fn burn_gpu(
     // Quick per-thread warmup so per-stream lazy state is up before the
     // measurement window opens. comgr cache is hot from prewarm so this is
     // fast.
-    eprintln!("GPU #{gpu_idx}: warming up hipBLASLt ({})", precision.name());
+    eprintln!(
+        "GPU #{gpu_idx}: warming up hipBLASLt ({})",
+        precision.name()
+    );
     for i in 0..PIPELINE_DEPTH {
         let rc = submit(&streams[i], &outputs[i]);
         if rc != sys::HIPBLAS_STATUS_SUCCESS {

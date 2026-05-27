@@ -123,8 +123,9 @@ unsafe extern "C" {
         size_in_bytes: usize,
     ) -> hipblasStatus_t;
 
-    pub fn hipblasLtMatmulPreferenceCreate(pref: *mut hipblasLtMatmulPreference_t)
-    -> hipblasStatus_t;
+    pub fn hipblasLtMatmulPreferenceCreate(
+        pref: *mut hipblasLtMatmulPreference_t,
+    ) -> hipblasStatus_t;
     pub fn hipblasLtMatmulPreferenceDestroy(pref: hipblasLtMatmulPreference_t) -> hipblasStatus_t;
     pub fn hipblasLtMatmulPreferenceSetAttribute(
         pref: hipblasLtMatmulPreference_t,
