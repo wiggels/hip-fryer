@@ -15,98 +15,160 @@
 // This file contains code derived from gpu-fryer by Hugging Face,
 // originally licensed under Apache License 2.0.
 
-use clap::Parser;
-use float8::F8E4M3;
-use rand::rngs::SmallRng;
-use rand::{RngCore, SeedableRng, rng};
-use rocm_rs::hip::bindings::{
-    hipDeviceAttribute_t, hipDeviceGetAttribute, hipDeviceProp_tR0600, hipDeviceptr_t,
-    hipError_t_hipSuccess, hipFree, hipGetDeviceCount, hipGetDevicePropertiesR0600, hipInit,
-    hipMalloc, hipMemGetInfo, hipMemcpyHtoD, hipMemset, hipSetDevice, hipStreamSynchronize,
-};
-use rocm_rs::rocblas::ffi::{
-    rocblas_create_handle, rocblas_datatype__rocblas_datatype_bf16_r,
-    rocblas_datatype__rocblas_datatype_f32_r, rocblas_destroy_handle,
-    rocblas_gemm_algo__rocblas_gemm_algo_standard, rocblas_gemm_ex, rocblas_handle,
-    rocblas_operation, rocblas_operation__rocblas_operation_none, rocblas_sgemm,
-    rocblas_status__rocblas_status_success,
-};
+mod sys;
+
+use clap::{Parser, ValueEnum};
 use rocm_smi_lib::{RocmSmi, RocmSmiDevice, RsmiTemperatureMetric, RsmiTemperatureType};
-use std::fmt::Debug;
-use std::marker::PhantomData;
+use std::ffi::c_void;
 use std::ptr;
+use std::os::fd::RawFd;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex, OnceLock};
 use tokio::signal;
 use tokio::sync::mpsc::{
     UnboundedReceiver as Receiver, UnboundedSender as Sender, unbounded_channel,
 };
 
-const SIZE: usize = 8192; // Ensure SIZE % 16 == 0 for Tensor Core optimization
-const MEM_TO_USE_PCT: f64 = 0.90; // Use 90% of GPU memory
+// Default square matrix size. 16384 is a good baseline on MI355X: large enough
+// to keep every matrix core busy while small enough that per-kernel variance
+// fits inside our 1s reporting tick. Override with --size to sweep toward peak;
+// bigger N raises matrix-core occupancy and arithmetic intensity.
+const DEFAULT_SIZE: usize = 16384;
+const MEM_TO_USE_PCT: f64 = 0.85;
 const MIN_DURATION_SECS: u64 = 10;
+const WORKSPACE_BYTES: usize = 128 * 1024 * 1024; // 128 MiB workspace per hipBLASLt handle
+// Number of independent streams (and matching output buffers) per GPU.
+// Each stream keeps one matmul in flight while we sync the next. On
+// MI355X / hipBLASLt 1.2.2, depth 4 measured ~8% higher throughput than
+// single-stream submit-no-sync — host launch overhead is non-trivial here.
+const PIPELINE_DEPTH: usize = 4;
+// Number of algos to ask hipBLASLt for during tuning; we time each in the
+// prewarm as a sanity check. The heuristic returns algos in order of
+// estimated throughput so the first one is almost always the winner.
+//
+// NOTE: we deliberately burn with algos[0] (the heuristic's first pick), NOT a
+// per-GPU "fastest by timing" choice. Two reasons, both learned the hard way:
+// (1) single-shot matmul timing is overhead-dominated and mis-ranks vs. the
+// pipelined steady state, and (2) actually executing arbitrary FP8 candidates
+// can hang the GPU (rocRoller JIT/exec hangs). algos[0] is the stable kernel.
+const TUNE_ALGOS: usize = 4;
 
-const GPU_THROTTLING_REASON: &str =
-    "GPU is throttled. Check the throttling reasons and temperatures";
 const GPU_FLOPS_REASON: &str =
     "GPU is not performing as expected. Check the flops values and temperatures";
 
-type AllocBufferTuple<T> = (HipSlice<T>, HipSlice<T>, Vec<HipSlice<T>>);
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Precision {
+    Fp32,
+    Bf16,
+    /// OCP FP8 (E4M3)
+    Fp8,
+}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ThrottleStatus {
-    pub thermal_throttling: bool,
-    pub power_throttling: bool,
-    pub current_throttling: bool,
+impl Precision {
+    fn name(&self) -> &'static str {
+        match self {
+            Precision::Fp32 => "FP32",
+            Precision::Bf16 => "BF16",
+            Precision::Fp8 => "FP8 (E4M3)",
+        }
+    }
+
+    fn bytes_per_element(&self) -> usize {
+        match self {
+            Precision::Fp32 => 4,
+            Precision::Bf16 => 2,
+            Precision::Fp8 => 1,
+        }
+    }
+
+    fn matrix_bytes(&self, n: usize) -> usize {
+        n * n * self.bytes_per_element()
+    }
+
+    fn data_type(&self) -> sys::hipDataType {
+        match self {
+            Precision::Fp32 => sys::HIP_R_32F,
+            Precision::Bf16 => sys::HIP_R_16BF,
+            Precision::Fp8 => sys::HIP_R_8F_E4M3,
+        }
+    }
+
+    /// Output ("D") tensor type. We always accumulate in f32, then write the
+    /// result out as the smallest precision that doesn't cost us matrix-core
+    /// throughput. For FP8 inputs the convention (matches HuggingFace's CUDA
+    /// gpu-fryer and AMD's hipBLASLt samples) is to write BF16 — that's 4x
+    /// less writeback bandwidth than f32 and lets the next matmul start sooner.
+    fn output_data_type(&self) -> sys::hipDataType {
+        match self {
+            Precision::Fp32 => sys::HIP_R_32F,
+            Precision::Bf16 | Precision::Fp8 => sys::HIP_R_16BF,
+        }
+    }
+
+    fn output_bytes_per_element(&self) -> usize {
+        match self.output_data_type() {
+            x if x == sys::HIP_R_32F => 4,
+            x if x == sys::HIP_R_16BF => 2,
+            _ => 4,
+        }
+    }
+
+    fn output_matrix_bytes(&self, n: usize) -> usize {
+        n * n * self.output_bytes_per_element()
+    }
+
+    /// FP8 matmul kernels on CDNA4 only ship a tuned path for the TN data
+    /// layout (transA = T, transB = N); NN works but at lower throughput.
+    fn prefers_tn_layout(&self) -> bool {
+        matches!(self, Precision::Fp8)
+    }
 }
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    /// Duration in seconds to burn the GPUs
+    /// Duration in seconds to burn the GPUs.
     #[clap(default_value = "60")]
     duration_secs: u64,
-    /// Tolerate software throttling if the TFLOPS are in the acceptable range
-    #[clap(long, default_value = "false")]
-    tolerate_software_throttling: bool,
-    /// TFLOPS tolerance (%) compared to best GPU
-    /// If the TFLOPS are within `tflops_tolerance`% of the best performing GPU, test will pass
+    /// Pass threshold: each GPU must be within this % of the best GPU's average.
     #[clap(long, default_value = "10")]
     tflops_tolerance: f64,
-    /// Use FP32 precision. If unset, will use FP32 if no GPUs support BF16 or FP8.
-    #[clap(long)]
-    use_fp32: bool,
-    /// Use BF16 precision. GPU must support BF16 type. If unset, will use BF16 only if all GPUs support it.
-    #[clap(long)]
-    use_bf16: bool,
-    /// Use FP8 precision. GPU must support FP8 type.
-    #[clap(long)]
-    use_fp8: bool,
+    /// Numeric format used for the burn GEMM. Defaults to the highest-throughput
+    /// format every visible GPU supports.
+    #[clap(long, value_enum)]
+    precision: Option<Precision>,
+    /// Square GEMM dimension N (the burn runs an N×N×N matmul). Larger N raises
+    /// matrix-core occupancy and arithmetic intensity. Must be a multiple of 64.
+    #[clap(long, default_value_t = DEFAULT_SIZE)]
+    size: usize,
 }
 
 #[derive(Debug, Clone)]
 struct BurnResult {
     gpu_idx: usize,
-    flops_max: usize,
-    flops_min: usize,
-    flops_sum: usize,
+    flops_max: f64,
+    flops_min: f64,
+    flops_sum: f64,
     n_iters: usize,
-    temp_max: usize,
-    temp_sum: usize,
-    temp_min: usize,
-    temp_count: usize, // Separate counter for temperature readings
-    throttling_hw: usize,
-    throttling_thermal_sw: usize,
-    throttling_thermal_hw: usize,
+    temp_max: u32,
+    temp_sum: u64,
+    temp_min: u32,
+    temp_count: u32,
 }
 
 impl BurnResult {
     fn new(gpu_idx: usize) -> Self {
         Self {
             gpu_idx,
-            flops_min: usize::MAX,
-            temp_min: usize::MAX,
-            ..Default::default()
+            flops_max: 0.0,
+            flops_min: f64::INFINITY,
+            flops_sum: 0.0,
+            n_iters: 0,
+            temp_max: 0,
+            temp_sum: 0,
+            temp_min: u32::MAX,
+            temp_count: 0,
         }
     }
 
@@ -114,7 +176,7 @@ impl BurnResult {
         if self.n_iters == 0 {
             0.0
         } else {
-            self.flops_sum as f64 / self.n_iters as f64
+            self.flops_sum / self.n_iters as f64
         }
     }
 
@@ -125,125 +187,126 @@ impl BurnResult {
             self.temp_sum as f64 / self.temp_count as f64
         }
     }
-
-    fn is_throttled(&self) -> bool {
-        self.throttling_hw > 0 || self.throttling_thermal_sw > 0 || self.throttling_thermal_hw > 0
-    }
-}
-
-impl Default for BurnResult {
-    fn default() -> Self {
-        Self {
-            gpu_idx: 0,
-            flops_max: 0,
-            flops_min: usize::MAX,
-            flops_sum: 0,
-            n_iters: 0,
-            temp_max: 0,
-            temp_sum: 0,
-            temp_min: usize::MAX,
-            temp_count: 0,
-            throttling_hw: 0,
-            throttling_thermal_sw: 0,
-            throttling_thermal_hw: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
 struct Config {
     duration_secs: u64,
     tflops_tolerance: f64,
-    tolerate_software_throttling: bool,
-    use_bf16: bool,
-    use_fp8: bool,
-    use_fp32: bool,
+    precision: Precision,
+    /// Square GEMM dimension N for this run (the burn does N×N×N).
+    size: usize,
+    /// Algorithm bytes selected by the prewarm tuner. Cloned into every burn
+    /// thread so they share the same chosen kernel.
+    tuned_algo: sys::hipblasLtMatmulAlgo_t,
 }
 
-// Safe HIP memory slice (similar to CudaSlice)
-pub struct HipSlice<T> {
-    ptr: hipDeviceptr_t,
-    len: usize,
-    _phantom: PhantomData<T>,
+// --- stderr suppression -------------------------------------------------------
+
+/// RAII guard that redirects fd 2 (stderr) to /dev/null for its lifetime.
+///
+/// hipBLASLt's `origami` latency-prediction model unconditionally writes a
+/// "Warning: Latency not found ... mi_input_type=BFloat8Float8_fnuz" line to
+/// `std::cerr` for every FP8 candidate solution it scores inside
+/// `hipblasLtMatmulAlgoGetHeuristic`. No env var or log level gates it, so the
+/// only way to keep the console readable is to mute fd 2 across the heuristic
+/// call. Our progress output is on stdout, so it is never affected; the burn
+/// loop runs an explicit algo (no heuristic), so it never re-triggers the warning.
+///
+/// A process-global mutex serializes the dup2 save/restore so concurrent
+/// per-GPU heuristic queries can't race on the shared fd. `new` returns `None`
+/// if the redirect can't be set up, in which case we simply let the warnings through.
+struct StderrSilencer {
+    saved: RawFd,
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
-impl<T> HipSlice<T> {
-    pub fn alloc_zeros(len: usize) -> anyhow::Result<Self> {
+impl StderrSilencer {
+    fn new() -> Option<Self> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
         unsafe {
-            let mut ptr: hipDeviceptr_t = ptr::null_mut();
-            let byte_size = len * std::mem::size_of::<T>();
-            let result = hipMalloc(&mut ptr, byte_size);
-            if result != hipError_t_hipSuccess {
-                return Err(anyhow::anyhow!(
-                    "Failed to allocate GPU memory: {:?}",
-                    result
-                ));
+            let saved = libc::dup(libc::STDERR_FILENO);
+            if saved < 0 {
+                return None;
             }
-
-            // Zero the memory
-            let result = hipMemset(ptr, 0, byte_size);
-            if result != hipError_t_hipSuccess {
-                let _ = hipFree(ptr); // Clean up on error
-                return Err(anyhow::anyhow!("Failed to zero GPU memory: {:?}", result));
+            let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+            if devnull < 0 {
+                libc::close(saved);
+                return None;
             }
-
-            Ok(HipSlice {
-                ptr,
-                len,
-                _phantom: PhantomData,
-            })
+            let rc = libc::dup2(devnull, libc::STDERR_FILENO);
+            libc::close(devnull);
+            if rc < 0 {
+                libc::close(saved);
+                return None;
+            }
+            Some(Self { saved, _lock: lock })
         }
     }
-
-    pub fn from_host_data(data: Vec<T>) -> anyhow::Result<Self> {
-        unsafe {
-            let mut ptr: hipDeviceptr_t = ptr::null_mut();
-            let byte_size = data.len() * std::mem::size_of::<T>();
-            let result = hipMalloc(&mut ptr, byte_size);
-            if result != hipError_t_hipSuccess {
-                return Err(anyhow::anyhow!(
-                    "Failed to allocate GPU memory: {:?}",
-                    result
-                ));
-            }
-
-            let result = hipMemcpyHtoD(ptr, data.as_ptr() as *mut std::ffi::c_void, byte_size);
-            if result != hipError_t_hipSuccess {
-                let _ = hipFree(ptr); // Clean up on error
-                return Err(anyhow::anyhow!("Failed to copy data to GPU: {:?}", result));
-            }
-
-            Ok(HipSlice {
-                ptr,
-                len: data.len(),
-                _phantom: PhantomData,
-            })
-        }
-    }
-
-    pub fn as_ptr(&self) -> *mut T {
-        self.ptr as *mut T
-    }
-
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
 }
 
-impl<T> Drop for HipSlice<T> {
+impl Drop for StderrSilencer {
     fn drop(&mut self) {
         unsafe {
-            let _ = hipFree(self.ptr);
+            libc::dup2(self.saved, libc::STDERR_FILENO);
+            libc::close(self.saved);
         }
     }
 }
 
-// Safe HIP abstractions (similar to cudarc design)
+// --- HIP wrappers -------------------------------------------------------------
+
+fn hip_check(rc: sys::hipError_t, ctx: &str) -> anyhow::Result<()> {
+    if rc == sys::hipSuccess {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("{ctx} failed with HIP error {rc}"))
+    }
+}
+
+fn lt_check(rc: sys::hipblasStatus_t, ctx: &str) -> anyhow::Result<()> {
+    if rc == sys::HIPBLAS_STATUS_SUCCESS {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("{ctx} failed with hipBLAS status {rc}"))
+    }
+}
+
+pub struct DeviceBuffer {
+    ptr: sys::hipDeviceptr_t,
+    bytes: usize,
+}
+
+impl DeviceBuffer {
+    pub fn alloc_filled(bytes: usize, fill_byte: u8) -> anyhow::Result<Self> {
+        unsafe {
+            let mut ptr: sys::hipDeviceptr_t = ptr::null_mut();
+            hip_check(sys::hipMalloc(&mut ptr, bytes), "hipMalloc")?;
+            hip_check(
+                sys::hipMemset(ptr, fill_byte as i32, bytes),
+                "hipMemset (fill)",
+            )?;
+            Ok(Self { ptr, bytes })
+        }
+    }
+
+    pub fn as_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+}
+
+impl Drop for DeviceBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = sys::hipFree(self.ptr);
+        }
+        self.bytes = 0;
+    }
+}
+
 pub struct HipContext {
     device_id: i32,
     name: String,
@@ -252,30 +315,15 @@ pub struct HipContext {
 impl HipContext {
     pub fn new(device_id: i32) -> anyhow::Result<Self> {
         unsafe {
-            // Set device
-            let result = hipSetDevice(device_id);
-            if result != hipError_t_hipSuccess {
-                return Err(anyhow::anyhow!(
-                    "Failed to set device {}: {:?}",
-                    device_id,
-                    result
-                ));
-            }
-
-            // Get device properties
-            let mut props: hipDeviceProp_tR0600 = std::mem::zeroed();
-            let result = hipGetDevicePropertiesR0600(&mut props, device_id);
-            if result != hipError_t_hipSuccess {
-                return Err(anyhow::anyhow!(
-                    "Failed to get device properties: {:?}",
-                    result
-                ));
-            }
-
-            let name = std::ffi::CStr::from_ptr(props.name.as_ptr())
+            hip_check(sys::hipSetDevice(device_id), "hipSetDevice")?;
+            let mut buf = [0i8; 256];
+            hip_check(
+                sys::hipDeviceGetName(buf.as_mut_ptr(), buf.len() as i32, device_id),
+                "hipDeviceGetName",
+            )?;
+            let name = std::ffi::CStr::from_ptr(buf.as_ptr())
                 .to_string_lossy()
-                .to_string();
-
+                .into_owned();
             Ok(HipContext { device_id, name })
         }
     }
@@ -283,10 +331,7 @@ impl HipContext {
     pub fn device_count() -> anyhow::Result<i32> {
         unsafe {
             let mut count = 0;
-            let result = hipGetDeviceCount(&mut count);
-            if result != hipError_t_hipSuccess {
-                return Err(anyhow::anyhow!("Failed to get device count: {:?}", result));
-            }
+            hip_check(sys::hipGetDeviceCount(&mut count), "hipGetDeviceCount")?;
             Ok(count)
         }
     }
@@ -300,30 +345,7 @@ impl HipContext {
     }
 
     pub fn set_current(&self) -> anyhow::Result<()> {
-        unsafe {
-            let result = hipSetDevice(self.device_id);
-            if result != hipError_t_hipSuccess {
-                return Err(anyhow::anyhow!(
-                    "Failed to set current device: {:?}",
-                    result
-                ));
-            }
-            Ok(())
-        }
-    }
-
-    pub fn get_attribute(&self, attr: hipDeviceAttribute_t) -> anyhow::Result<i32> {
-        unsafe {
-            let mut value = 0;
-            let result = hipDeviceGetAttribute(&mut value, attr, self.device_id);
-            if result != hipError_t_hipSuccess {
-                return Err(anyhow::anyhow!(
-                    "Failed to get device attribute: {:?}",
-                    result
-                ));
-            }
-            Ok(value)
-        }
+        unsafe { hip_check(sys::hipSetDevice(self.device_id), "hipSetDevice") }
     }
 
     pub fn mem_get_info(&self) -> anyhow::Result<(usize, usize)> {
@@ -331,292 +353,176 @@ impl HipContext {
         unsafe {
             let mut free: usize = 0;
             let mut total: usize = 0;
-            let result = hipMemGetInfo(&mut free, &mut total);
-            if result != hipError_t_hipSuccess {
-                return Err(anyhow::anyhow!("Failed to get memory info: {:?}", result));
-            }
+            hip_check(sys::hipMemGetInfo(&mut free, &mut total), "hipMemGetInfo")?;
             Ok((free, total))
         }
     }
+}
 
-    pub fn alloc_zeros<T>(&self, len: usize) -> anyhow::Result<HipSlice<T>> {
-        HipSlice::alloc_zeros(len)
-    }
+// --- hipBLASLt wrappers --------------------------------------------------------
 
-    pub fn htod_copy<T: Clone>(&self, data: Vec<T>) -> anyhow::Result<HipSlice<T>> {
-        HipSlice::from_host_data(data)
-    }
+struct LtHandle(sys::hipblasLtHandle_t);
 
-    pub fn synchronize(&self) -> anyhow::Result<()> {
+impl LtHandle {
+    fn new() -> anyhow::Result<Self> {
         unsafe {
-            let result = hipStreamSynchronize(ptr::null_mut());
-            if result != hipError_t_hipSuccess {
-                return Err(anyhow::anyhow!(
-                    "Stream synchronization failed: {:?}",
-                    result
-                ));
-            }
-            Ok(())
+            let mut h: sys::hipblasLtHandle_t = ptr::null_mut();
+            lt_check(sys::hipblasLtCreate(&mut h), "hipblasLtCreate")?;
+            Ok(Self(h))
         }
     }
 }
 
-// Safe ROCBlas handle wrapper
-pub struct RocBlasHandle {
-    handle: rocblas_handle,
-}
-
-impl RocBlasHandle {
-    pub fn new() -> anyhow::Result<Self> {
-        unsafe {
-            let mut handle: rocblas_handle = ptr::null_mut();
-            let status = rocblas_create_handle(&mut handle);
-            if status != rocblas_status__rocblas_status_success {
-                return Err(anyhow::anyhow!(
-                    "Failed to create ROCBlas handle: {:?}",
-                    status
-                ));
-            }
-            Ok(RocBlasHandle { handle })
-        }
-    }
-
-    pub fn sgemm(
-        &self,
-        params: &GemmParams,
-        alpha: &f32,
-        a: &HipSlice<f32>,
-        b: &HipSlice<f32>,
-        beta: &f32,
-        c: &mut HipSlice<f32>,
-    ) -> anyhow::Result<()> {
-        unsafe {
-            let status = rocblas_sgemm(
-                self.handle,
-                params.transa,
-                params.transb,
-                params.m,
-                params.n,
-                params.k,
-                alpha as *const f32,
-                a.as_ptr() as *const f32,
-                params.lda,
-                b.as_ptr() as *const f32,
-                params.ldb,
-                beta as *const f32,
-                c.as_ptr(),
-                params.ldc,
-            );
-            if status != rocblas_status__rocblas_status_success {
-                return Err(anyhow::anyhow!("ROCBlas SGEMM failed: {:?}", status));
-            }
-            Ok(())
-        }
-    }
-
-    pub fn gemm_ex_bf16(
-        &self,
-        params: &GemmParams,
-        alpha: &half::bf16,
-        a: &HipSlice<half::bf16>,
-        b: &HipSlice<half::bf16>,
-        beta: &half::bf16,
-        c: &mut HipSlice<half::bf16>,
-    ) -> anyhow::Result<()> {
-        unsafe {
-            let alpha_f32 = alpha.to_f32();
-            let beta_f32 = beta.to_f32();
-
-            let status = rocblas_gemm_ex(
-                self.handle,
-                params.transa,
-                params.transb,
-                params.m,
-                params.n,
-                params.k,
-                &alpha_f32 as *const f32 as *const std::ffi::c_void,
-                a.as_ptr() as *const std::ffi::c_void,
-                rocblas_datatype__rocblas_datatype_bf16_r,
-                params.lda,
-                b.as_ptr() as *const std::ffi::c_void,
-                rocblas_datatype__rocblas_datatype_bf16_r,
-                params.ldb,
-                &beta_f32 as *const f32 as *const std::ffi::c_void,
-                c.as_ptr() as *const std::ffi::c_void,
-                rocblas_datatype__rocblas_datatype_bf16_r,
-                params.ldc,
-                c.as_ptr() as *mut std::ffi::c_void,
-                rocblas_datatype__rocblas_datatype_bf16_r,
-                params.ldc,
-                rocblas_datatype__rocblas_datatype_f32_r,
-                rocblas_gemm_algo__rocblas_gemm_algo_standard,
-                0,
-                0,
-            );
-            if status != rocblas_status__rocblas_status_success {
-                return Err(anyhow::anyhow!("ROCBlas BF16 GEMM failed: {:?}", status));
-            }
-            Ok(())
-        }
-    }
-
-    // FP8 GEMM - placeholder implementation because we need to use hipBLASLt
-    pub fn gemm_ex_fp8(
-        &self,
-        _params: &GemmParams,
-        _alpha: &F8E4M3,
-        _a: &HipSlice<F8E4M3>,
-        _b: &HipSlice<F8E4M3>,
-        _beta: &F8E4M3,
-        _c: &mut HipSlice<F8E4M3>,
-    ) -> anyhow::Result<()> {
-        // For now, we'll return an error
-        Err(anyhow::anyhow!(
-            "FP8 GEMM not yet supported in this ROCBlas version"
-        ))
-    }
-}
-
-impl Drop for RocBlasHandle {
+impl Drop for LtHandle {
     fn drop(&mut self) {
         unsafe {
-            let _ = rocblas_destroy_handle(self.handle);
+            let _ = sys::hipblasLtDestroy(self.0);
         }
     }
 }
 
-// GEMM operation parameters to reduce function argument count
-#[derive(Debug, Clone)]
-pub struct GemmParams {
-    pub transa: rocblas_operation,
-    pub transb: rocblas_operation,
-    pub m: i32,
-    pub n: i32,
-    pub k: i32,
-    pub lda: i32,
-    pub ldb: i32,
-    pub ldc: i32,
-}
+struct MatLayout(sys::hipblasLtMatrixLayout_t);
 
-impl Default for GemmParams {
-    fn default() -> Self {
-        Self {
-            transa: rocblas_operation__rocblas_operation_none,
-            transb: rocblas_operation__rocblas_operation_none,
-            m: SIZE as i32,
-            n: SIZE as i32,
-            k: SIZE as i32,
-            lda: SIZE as i32,
-            ldb: SIZE as i32,
-            ldc: SIZE as i32,
+impl MatLayout {
+    fn new(dtype: sys::hipDataType, rows: u64, cols: u64, ld: i64) -> anyhow::Result<Self> {
+        unsafe {
+            let mut l: sys::hipblasLtMatrixLayout_t = ptr::null_mut();
+            lt_check(
+                sys::hipblasLtMatrixLayoutCreate(&mut l, dtype, rows, cols, ld),
+                "hipblasLtMatrixLayoutCreate",
+            )?;
+            Ok(Self(l))
         }
     }
 }
 
-trait VariablePrecisionFloat: Copy + Debug + Send + Sync + Unpin + 'static {
-    fn from_f32(f: f32) -> Self;
-    fn compute_gemm(
-        handle: &RocBlasHandle,
-        a: &HipSlice<Self>,
-        b: &HipSlice<Self>,
-        c: &mut HipSlice<Self>,
-    ) -> anyhow::Result<()>;
-}
-
-impl VariablePrecisionFloat for f32 {
-    fn from_f32(f: f32) -> Self {
-        f
-    }
-
-    fn compute_gemm(
-        handle: &RocBlasHandle,
-        a: &HipSlice<Self>,
-        b: &HipSlice<Self>,
-        c: &mut HipSlice<Self>,
-    ) -> anyhow::Result<()> {
-        let params = GemmParams::default();
-        handle.sgemm(&params, &1.0f32, a, b, &0.0f32, c)
+impl Drop for MatLayout {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = sys::hipblasLtMatrixLayoutDestroy(self.0);
+        }
     }
 }
 
-impl VariablePrecisionFloat for half::bf16 {
-    fn from_f32(f: f32) -> Self {
-        half::bf16::from_f32(f)
+struct MatmulDesc(sys::hipblasLtMatmulDesc_t);
+
+impl MatmulDesc {
+    fn new(compute: sys::hipblasComputeType_t, scale: sys::hipDataType) -> anyhow::Result<Self> {
+        unsafe {
+            let mut d: sys::hipblasLtMatmulDesc_t = ptr::null_mut();
+            lt_check(
+                sys::hipblasLtMatmulDescCreate(&mut d, compute, scale),
+                "hipblasLtMatmulDescCreate",
+            )?;
+            Ok(Self(d))
+        }
     }
 
-    fn compute_gemm(
-        handle: &RocBlasHandle,
-        a: &HipSlice<Self>,
-        b: &HipSlice<Self>,
-        c: &mut HipSlice<Self>,
-    ) -> anyhow::Result<()> {
-        let params = GemmParams::default();
-        handle.gemm_ex_bf16(
-            &params,
-            &half::bf16::from_f32(1.0),
-            a,
-            b,
-            &half::bf16::from_f32(0.0),
-            c,
-        )
+    fn set_i32(&self, attr: sys::hipblasLtMatmulDescAttributes_t, value: i32) -> anyhow::Result<()> {
+        unsafe {
+            lt_check(
+                sys::hipblasLtMatmulDescSetAttribute(
+                    self.0,
+                    attr,
+                    &value as *const i32 as *const c_void,
+                    std::mem::size_of::<i32>(),
+                ),
+                "hipblasLtMatmulDescSetAttribute(i32)",
+            )
+        }
     }
 }
 
-impl VariablePrecisionFloat for F8E4M3 {
-    fn from_f32(f: f32) -> Self {
-        F8E4M3::from_f32(f)
-    }
-
-    fn compute_gemm(
-        handle: &RocBlasHandle,
-        a: &HipSlice<Self>,
-        b: &HipSlice<Self>,
-        c: &mut HipSlice<Self>,
-    ) -> anyhow::Result<()> {
-        let params = GemmParams::default();
-        handle.gemm_ex_fp8(
-            &params,
-            &F8E4M3::from_f32(1.0),
-            a,
-            b,
-            &F8E4M3::from_f32(0.0),
-            c,
-        )
+impl Drop for MatmulDesc {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = sys::hipblasLtMatmulDescDestroy(self.0);
+        }
     }
 }
+
+struct MatmulPref(sys::hipblasLtMatmulPreference_t);
+
+impl MatmulPref {
+    fn new(max_workspace_bytes: u64) -> anyhow::Result<Self> {
+        unsafe {
+            let mut p: sys::hipblasLtMatmulPreference_t = ptr::null_mut();
+            lt_check(
+                sys::hipblasLtMatmulPreferenceCreate(&mut p),
+                "hipblasLtMatmulPreferenceCreate",
+            )?;
+            lt_check(
+                sys::hipblasLtMatmulPreferenceSetAttribute(
+                    p,
+                    sys::HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                    &max_workspace_bytes as *const u64 as *const c_void,
+                    std::mem::size_of::<u64>(),
+                ),
+                "hipblasLtMatmulPreferenceSetAttribute(workspace)",
+            )?;
+            Ok(Self(p))
+        }
+    }
+}
+
+impl Drop for MatmulPref {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = sys::hipblasLtMatmulPreferenceDestroy(self.0);
+        }
+    }
+}
+
+struct Stream(sys::hipStream_t);
+
+impl Stream {
+    fn new() -> anyhow::Result<Self> {
+        unsafe {
+            let mut s: sys::hipStream_t = ptr::null_mut();
+            hip_check(sys::hipStreamCreate(&mut s), "hipStreamCreate")?;
+            Ok(Self(s))
+        }
+    }
+
+    fn sync(&self) -> anyhow::Result<()> {
+        unsafe { hip_check(sys::hipStreamSynchronize(self.0), "hipStreamSynchronize") }
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = sys::hipStreamDestroy(self.0);
+        }
+    }
+}
+
+// --- SMI wrapper --------------------------------------------------------------
 
 pub struct RocmSmiWrapper {
-    _smi: RocmSmi, // keep the SMI instance alive
+    _smi: RocmSmi,
     devices: Vec<Option<RocmSmiDevice>>,
     device_count: u32,
 }
 
 impl RocmSmiWrapper {
     pub fn new() -> anyhow::Result<Self> {
-        // Try to initialize ROCm SMI with better error handling
-        let smi = RocmSmi::init().map_err(|e| anyhow::anyhow!("Failed to init ROCm SMI: {e:?}"))?;
-
-        // Try to create devices for detected GPUs
+        let smi =
+            RocmSmi::init().map_err(|e| anyhow::anyhow!("Failed to init ROCm SMI: {e:?}"))?;
         let mut devices = Vec::new();
         let mut device_count = 0u32;
-
-        // Try to create devices up to a reasonable limit
         for i in 0..16 {
             match RocmSmiDevice::new(i) {
                 Ok(device) => {
                     devices.push(Some(device));
                     device_count += 1;
                 }
-                Err(_) => {
-                    if device_count == 0 && i == 0 {
-                        // If we can't create even the first device, fail
-                        return Err(anyhow::anyhow!("No ROCm SMI devices found"));
-                    }
-                    break; // No more devices
-                }
+                Err(_) => break,
             }
         }
-
+        if device_count == 0 {
+            return Err(anyhow::anyhow!("No ROCm SMI devices found"));
+        }
         Ok(RocmSmiWrapper {
             _smi: smi,
             devices,
@@ -624,51 +530,102 @@ impl RocmSmiWrapper {
         })
     }
 
-    pub fn device_count(&self) -> u32 {
-        self.device_count
-    }
-
     pub fn get_temperature(&mut self, device_id: u32) -> anyhow::Result<u32> {
         if device_id >= self.device_count {
-            return Err(anyhow::anyhow!("Device ID {} out of range", device_id));
+            return Err(anyhow::anyhow!("Device ID {device_id} out of range"));
         }
-
-        let device = match &mut self.devices[device_id as usize] {
-            Some(dev) => dev,
-            None => return Err(anyhow::anyhow!("Device {} not available", device_id)),
-        };
-
-        let temp_types = [
-            RsmiTemperatureType::Edge,
+        let device = self.devices[device_id as usize]
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Device {device_id} not available"))?;
+        for ty in [
             RsmiTemperatureType::Junction,
+            RsmiTemperatureType::Edge,
             RsmiTemperatureType::Memory,
-        ];
-
-        for ty in temp_types {
-            if let Ok(temp) = device.get_temperature_metric(ty, RsmiTemperatureMetric::Current) {
-                return Ok(temp as u32);
+        ] {
+            if let Ok(t) = device.get_temperature_metric(ty, RsmiTemperatureMetric::Current) {
+                return Ok(t as u32);
             }
         }
-
         Err(anyhow::anyhow!(
-            "Failed to read temperature for GPU {} from all known types",
-            device_id
+            "No temperature sensor responded for GPU {device_id}"
         ))
     }
+}
 
-    pub fn get_throttle_status(&mut self, device_id: u32) -> anyhow::Result<ThrottleStatus> {
-        if device_id >= self.device_count {
-            return Err(anyhow::anyhow!("Device ID {} out of range", device_id));
-        }
+// --- Peak throughput table ----------------------------------------------------
 
-        if let Some(ref mut _device) = self.devices[device_id as usize] {
-            // Try to get GPU metrics which may contain throttle information
-            Ok(ThrottleStatus::default())
-        } else {
-            Ok(ThrottleStatus::default())
+/// Returns dense peak in FLOP/s for (gpu name, precision) or `None` if we don't
+/// have a published spec for the part.
+fn peak_flops_per_sec(gpu_name: &str, precision: Precision) -> Option<f64> {
+    let n = gpu_name.to_lowercase();
+    // Each tuple: (substring matching the device name, peak in PFLOP/s for each
+    // precision). Sourced from AMD product briefs (dense, no structured sparsity).
+    // MI355X numbers from the user-supplied datasheet.
+    struct Spec {
+        match_str: &'static str,
+        fp32: f64,
+        bf16: f64,
+        fp8: f64,
+    }
+    const SPECS: &[Spec] = &[
+        Spec {
+            match_str: "mi355",
+            fp32: 0.1573,
+            bf16: 2.5,
+            fp8: 5.0,
+        },
+        Spec {
+            match_str: "mi325",
+            fp32: 0.1633,
+            bf16: 2.6,
+            fp8: 5.22,
+        },
+        Spec {
+            match_str: "mi300x",
+            fp32: 0.1633,
+            bf16: 2.6,
+            fp8: 5.22,
+        },
+        Spec {
+            match_str: "mi250",
+            fp32: 0.0479,
+            bf16: 0.383,
+            fp8: 0.0,
+        },
+        Spec {
+            match_str: "mi210",
+            fp32: 0.0226,
+            bf16: 0.181,
+            fp8: 0.0,
+        },
+    ];
+
+    let spec = SPECS.iter().find(|s| n.contains(s.match_str))?;
+    let v = match precision {
+        Precision::Fp32 => spec.fp32,
+        Precision::Bf16 => spec.bf16,
+        Precision::Fp8 => spec.fp8,
+    };
+    if v > 0.0 { Some(v * 1e15) } else { None }
+}
+
+fn precision_supported(gpu_name: &str, precision: Precision) -> bool {
+    peak_flops_per_sec(gpu_name, precision)
+        .map(|p| p > 0.0)
+        .unwrap_or(false)
+}
+
+fn auto_precision(gpus: &[Arc<HipContext>]) -> Precision {
+    // Prefer the highest-throughput format every GPU supports.
+    for p in [Precision::Fp8, Precision::Bf16] {
+        if gpus.iter().all(|g| precision_supported(g.name(), p)) {
+            return p;
         }
     }
+    Precision::Fp32
 }
+
+// --- Entry point --------------------------------------------------------------
 
 #[tokio::main]
 async fn main() {
@@ -677,276 +634,529 @@ async fn main() {
         eprintln!("Duration must be at least {MIN_DURATION_SECS} seconds");
         std::process::exit(1);
     }
-    if args.tflops_tolerance < 0.0 || args.tflops_tolerance > 100.0 {
+    if !(0.0..=100.0).contains(&args.tflops_tolerance) {
         eprintln!("TFLOPS tolerance must be between 0 and 100");
         std::process::exit(1);
     }
+    if args.size < 1024 || args.size % 64 != 0 {
+        eprintln!("--size must be a multiple of 64 and at least 1024");
+        std::process::exit(1);
+    }
 
-    let config = Config {
-        duration_secs: args.duration_secs,
-        tflops_tolerance: args.tflops_tolerance,
-        tolerate_software_throttling: args.tolerate_software_throttling,
-        use_fp32: args.use_fp32,
-        use_bf16: args.use_bf16,
-        use_fp8: args.use_fp8,
-    };
-
-    match run(config).await {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    };
+    if let Err(e) = run(args).await {
+        eprintln!("Error: {e:#}");
+        std::process::exit(1);
+    }
 }
 
-async fn run(config: Config) -> anyhow::Result<()> {
-    // Initialize HIP
-    unsafe {
-        let result = hipInit(0);
-        if result != hipError_t_hipSuccess {
-            return Err(anyhow::anyhow!("Failed to initialize HIP: {:?}", result));
-        }
-    }
+async fn run(args: Args) -> anyhow::Result<()> {
+    unsafe { hip_check(sys::hipInit(0), "hipInit")? };
 
     let gpus = detect_gpus()?;
     if gpus.is_empty() {
         return Err(anyhow::anyhow!("No GPUs detected"));
     }
-
-    for gpu in gpus.iter() {
+    for gpu in &gpus {
         println!("Detected GPU #{}: {}", gpu.ordinal(), gpu.name());
     }
 
-    // Determine precision to use
-    let (use_fp8, use_bf16, _use_fp32) = determine_precision(&config, &gpus)?;
-
-    if use_fp8 {
-        println!("Using FP8 precision");
-        run_with_precision::<F8E4M3>(config, gpus).await
-    } else if use_bf16 {
-        println!("Using BF16 precision");
-        run_with_precision::<half::bf16>(config, gpus).await
-    } else {
-        println!("Using FP32 precision");
-        run_with_precision::<f32>(config, gpus).await
-    }
-}
-
-fn determine_precision(
-    config: &Config,
-    gpus: &[Arc<HipContext>],
-) -> anyhow::Result<(bool, bool, bool)> {
-    // Check explicit flags first
-    if config.use_fp8 {
-        let all_support_fp8 = gpus.iter().all(|gpu| supports_fp8(gpu).unwrap_or(false));
-        if !all_support_fp8 {
-            return Err(anyhow::anyhow!(
-                "FP8 was explicitly requested but not all GPUs support it"
-            ));
+    let precision = match args.precision {
+        Some(p) => {
+            for gpu in &gpus {
+                if !precision_supported(gpu.name(), p) {
+                    return Err(anyhow::anyhow!(
+                        "Precision {} is not supported on {}",
+                        p.name(),
+                        gpu.name()
+                    ));
+                }
+            }
+            p
         }
-        return Ok((true, false, false));
-    }
+        None => auto_precision(&gpus),
+    };
 
-    if config.use_bf16 {
-        let all_support_bf16 = gpus.iter().all(|gpu| supports_bf16(gpu).unwrap_or(false));
-        if !all_support_bf16 {
-            return Err(anyhow::anyhow!(
-                "BF16 was explicitly requested but not all GPUs support it"
-            ));
-        }
-        return Ok((false, true, false));
-    }
+    let size = args.size;
+    println!("Using {} precision, {size}x{size} GEMM", precision.name());
 
-    if config.use_fp32 {
-        return Ok((false, false, true));
-    }
+    // hipBLASLt's first-call JIT holds a process-wide comgr lock. If every
+    // GPU races into it simultaneously they serialize. Warming a single GPU
+    // first populates the on-disk comgr cache so the parallel warmups that
+    // follow hit it instantly. We also use this pass to time several candidate
+    // algorithms and report the fastest one.
+    let tuned_algo = prewarm_kernel_cache(&gpus[0], precision, size)?;
 
-    // Auto-detect: prefer FP8 > BF16 > FP32
-    let all_support_fp8 = gpus.iter().all(|gpu| supports_fp8(gpu).unwrap_or(false));
-    if all_support_fp8 {
-        return Ok((true, false, false));
-    }
-
-    let all_support_bf16 = gpus.iter().all(|gpu| supports_bf16(gpu).unwrap_or(false));
-    if all_support_bf16 {
-        return Ok((false, true, false));
-    }
-
-    Ok((false, false, true))
-}
-
-async fn run_with_precision<T: VariablePrecisionFloat>(
-    config: Config,
-    gpus: Vec<Arc<HipContext>>,
-) -> anyhow::Result<()> {
-    println!("Creating random matrices");
-    let mut rng = SmallRng::from_rng(&mut rng());
-    let mut a = vec![T::from_f32(0.0); SIZE * SIZE];
-    let mut b = vec![T::from_f32(0.0); SIZE * SIZE];
-    for i in 0..SIZE * SIZE {
-        a[i] = T::from_f32((rng.next_u32() % 1000) as f32 / 1000.0);
-        b[i] = T::from_f32((rng.next_u32() % 1000) as f32 / 1000.0);
-    }
-    println!("Matrices created");
+    let config = Config {
+        duration_secs: args.duration_secs,
+        tflops_tolerance: args.tflops_tolerance,
+        precision,
+        size,
+        tuned_algo,
+    };
 
     let (tx, rx) = unbounded_channel::<(usize, usize)>();
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
     tokio::spawn(shutdown_signal(stop.clone()));
+
+    // Gate all burn threads behind a barrier so the first call into hipBLASLt
+    // (which JITs kernels) happens on every GPU before any of them start their
+    // measured burn loop. Without this, slow JIT serialization on the
+    // process-wide tuning cache makes some GPUs ramp up many seconds after
+    // others, which both pollutes the measurement window and looks broken.
+    let warmup_barrier = Arc::new(Barrier::new(gpus.len()));
 
     let mut handles = Vec::new();
     for gpu in gpus.iter() {
         let tx = tx.clone();
         let stop = stop.clone();
         let gpu = gpu.clone();
-        let a = a.clone();
-        let b = b.clone();
+        let config = config.clone();
+        let barrier = warmup_barrier.clone();
         let gpu_ordinal = gpu.ordinal();
-        let t = tokio::spawn(async move {
-            match burn_gpu(gpu_ordinal, gpu, a, b, tx, stop).await {
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("Unable to burn GPU #{gpu_ordinal}: {e:?}");
-                }
+        let t = std::thread::spawn(move || {
+            if let Err(e) = burn_gpu(gpu_ordinal, gpu, config, tx, stop, barrier) {
+                eprintln!("Unable to burn GPU #{gpu_ordinal}: {e:#}");
             }
         });
         handles.push(t);
     }
+    drop(tx);
 
-    // Report progress
-    let stop_clone = stop.clone();
-    let gpus_healthy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let gpus_healthy = Arc::new(AtomicBool::new(true));
     let gpus_healthy_clone = gpus_healthy.clone();
-    let config_clone = config.clone();
-    let t = tokio::spawn(async move {
-        report_progress(config_clone, gpus.len(), rx, stop_clone, gpus_healthy_clone).await;
+    let stop_clone = stop.clone();
+    let gpu_names: Vec<String> = gpus.iter().map(|g| g.name().to_string()).collect();
+    let config_for_report = config.clone();
+    let progress = tokio::spawn(async move {
+        report_progress(
+            config_for_report,
+            gpu_names,
+            rx,
+            stop_clone,
+            gpus_healthy_clone,
+        )
+        .await;
     });
-    handles.push(t);
-
-    // Burn for given duration
-    let wait = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        let mut tick = 0;
-        while !stop.load(std::sync::atomic::Ordering::Relaxed) && tick < config.duration_secs {
-            interval.tick().await;
-            tick += 1;
-        }
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        drop(tx);
-    });
-    handles.push(wait);
 
     for handle in handles {
-        handle.await.expect("Thread panicked");
+        if let Err(e) = handle.join() {
+            eprintln!("burn thread panicked: {e:?}");
+        }
     }
+    progress.await.ok();
 
-    if gpus_healthy.load(std::sync::atomic::Ordering::Relaxed) {
+    if gpus_healthy.load(Relaxed) {
         Ok(())
     } else {
         Err(anyhow::anyhow!("Some GPUs are not healthy"))
     }
 }
 
-fn poll_temperatures(
-    rocm_smi: &mut RocmSmiWrapper,
-    gpu_count: usize,
-) -> anyhow::Result<Vec<usize>> {
-    let mut temps = vec![0usize; gpu_count];
-    for (i, temp) in temps.iter_mut().enumerate().take(gpu_count) {
-        match rocm_smi.get_temperature(i as u32) {
-            Ok(t) => *temp = t as usize,
-            Err(_) => {
-                // If we can't get temp for this GPU, use 0 and continue
-                *temp = 0;
+struct DescriptorSet {
+    handle: LtHandle,
+    a: DeviceBuffer,
+    b: DeviceBuffer,
+    workspace: DeviceBuffer,
+    a_layout: MatLayout,
+    b_layout: MatLayout,
+    cd_layout: MatLayout,
+    desc: MatmulDesc,
+    pref: MatmulPref,
+}
+
+fn build_descriptors(precision: Precision, size: usize) -> anyhow::Result<DescriptorSet> {
+    let matrix_bytes = precision.matrix_bytes(size);
+
+    let a = DeviceBuffer::alloc_filled(matrix_bytes, 0x11)?;
+    let b = DeviceBuffer::alloc_filled(matrix_bytes, 0x22)?;
+    let workspace = DeviceBuffer::alloc_filled(WORKSPACE_BYTES, 0)?;
+
+    let handle = LtHandle::new()?;
+    let a_layout = MatLayout::new(precision.data_type(), size as u64, size as u64, size as i64)?;
+    let b_layout = MatLayout::new(precision.data_type(), size as u64, size as u64, size as i64)?;
+    let cd_layout = MatLayout::new(
+        precision.output_data_type(),
+        size as u64,
+        size as u64,
+        size as i64,
+    )?;
+
+    let desc = MatmulDesc::new(sys::HIPBLAS_COMPUTE_32F, sys::HIP_R_32F)?;
+    let trans_a = if precision.prefers_tn_layout() {
+        sys::HIPBLAS_OP_T
+    } else {
+        sys::HIPBLAS_OP_N
+    };
+    desc.set_i32(sys::HIPBLASLT_MATMUL_DESC_TRANSA, trans_a)?;
+    desc.set_i32(sys::HIPBLASLT_MATMUL_DESC_TRANSB, sys::HIPBLAS_OP_N)?;
+    let pref = MatmulPref::new(WORKSPACE_BYTES as u64)?;
+    Ok(DescriptorSet {
+        handle,
+        a,
+        b,
+        workspace,
+        a_layout,
+        b_layout,
+        cd_layout,
+        desc,
+        pref,
+    })
+}
+
+/// Time a single matmul + sync on the given stream with the given algo.
+fn time_matmul(
+    set: &DescriptorSet,
+    algo: &sys::hipblasLtMatmulAlgo_t,
+    out: &DeviceBuffer,
+    stream: &Stream,
+) -> anyhow::Result<f64> {
+    use std::time::Instant;
+    let alpha: f32 = 1.0;
+    let beta: f32 = 0.0;
+    let start = Instant::now();
+    unsafe {
+        lt_check(
+            sys::hipblasLtMatmul(
+                set.handle.0,
+                set.desc.0,
+                &alpha as *const f32 as *const c_void,
+                set.a.as_ptr(),
+                set.a_layout.0,
+                set.b.as_ptr(),
+                set.b_layout.0,
+                &beta as *const f32 as *const c_void,
+                out.as_ptr(),
+                set.cd_layout.0,
+                out.as_ptr(),
+                set.cd_layout.0,
+                algo,
+                set.workspace.as_ptr(),
+                WORKSPACE_BYTES,
+                stream.0,
+            ),
+            "hipblasLtMatmul (tune)",
+        )?;
+    }
+    stream.sync()?;
+    Ok(start.elapsed().as_secs_f64())
+}
+
+/// Allocate the minimum buffers needed to run one matmul of the requested
+/// precision on a single GPU, then ask hipBLASLt for up to `TUNE_ALGOS`
+/// candidate algorithms and time each one. Returns the algorithm with the
+/// highest measured throughput, and populates the on-disk comgr cache so the
+/// parallel burn threads don't all stall on the process-wide compile lock.
+fn prewarm_kernel_cache(
+    gpu: &HipContext,
+    precision: Precision,
+    size: usize,
+) -> anyhow::Result<sys::hipblasLtMatmulAlgo_t> {
+    use std::time::Instant;
+    println!(
+        "Pre-warming hipBLASLt kernel cache on GPU #{} for {} (tuning up to {TUNE_ALGOS} algos)...",
+        gpu.ordinal(),
+        precision.name()
+    );
+    let start = Instant::now();
+    gpu.set_current()?;
+
+    let set = build_descriptors(precision, size)?;
+    let output_bytes = precision.output_matrix_bytes(size);
+    let out = DeviceBuffer::alloc_filled(output_bytes, 0)?;
+    let stream = Stream::new()?;
+
+    let mut algos = vec![sys::hipblasLtMatmulHeuristicResult_t::default(); TUNE_ALGOS];
+    let mut returned: i32 = 0;
+    {
+        // FP8 solution scoring floods stderr with latency-table warnings; mute
+        // fd 2 just for the heuristic call. See StderrSilencer.
+        let _silencer = (precision == Precision::Fp8)
+            .then(StderrSilencer::new)
+            .flatten();
+        unsafe {
+            lt_check(
+                sys::hipblasLtMatmulAlgoGetHeuristic(
+                    set.handle.0,
+                    set.desc.0,
+                    set.a_layout.0,
+                    set.b_layout.0,
+                    set.cd_layout.0,
+                    set.cd_layout.0,
+                    set.pref.0,
+                    algos.len() as i32,
+                    algos.as_mut_ptr(),
+                    &mut returned,
+                ),
+                "hipblasLtMatmulAlgoGetHeuristic (prewarm)",
+            )?;
+        }
+    }
+    if returned < 1 {
+        return Err(anyhow::anyhow!(
+            "hipBLASLt returned no algorithm for {}",
+            precision.name()
+        ));
+    }
+
+    let mut best_algo = algos[0].algo;
+    let mut best_time = f64::INFINITY;
+    let flops_per_matmul = 2.0 * (size as f64).powi(3);
+
+    // Discard the very first matmul to absorb hipBLASLt's lazy initialization
+    // and any one-shot JIT cost. After that, each algo gets one timed sample.
+    let _ = time_matmul(&set, &algos[0].algo, &out, &stream)?;
+    for (i, r) in algos.iter().take(returned as usize).enumerate() {
+        let t = time_matmul(&set, &r.algo, &out, &stream)?;
+        let tflops = flops_per_matmul / t / 1e12;
+        println!("  algo {i:>2}: {t:>6.3}s  ({tflops:>7.1} TFLOP/s)");
+        if t < best_time {
+            best_time = t;
+            best_algo = r.algo;
+        }
+    }
+    let best_tflops = flops_per_matmul / best_time / 1e12;
+    println!(
+        "Best algo: {best_tflops:.1} TFLOP/s ({:.1}s spent tuning)",
+        start.elapsed().as_secs_f64()
+    );
+    Ok(best_algo)
+}
+
+// --- Burn task (one OS thread per GPU) ----------------------------------------
+
+fn burn_gpu(
+    gpu_idx: usize,
+    gpu: Arc<HipContext>,
+    config: Config,
+    tx: Sender<(usize, usize)>,
+    stop: Arc<AtomicBool>,
+    warmup_barrier: Arc<Barrier>,
+) -> anyhow::Result<()> {
+    gpu.set_current()?;
+    let precision = config.precision;
+    let size = config.size;
+    let output_bytes = precision.output_matrix_bytes(size);
+
+    let (free_mem, _) = gpu.mem_get_info()?;
+    let budget = (free_mem as f64 * MEM_TO_USE_PCT) as usize;
+    let consumed = precision.matrix_bytes(size) * 2 + WORKSPACE_BYTES;
+    if consumed + output_bytes * PIPELINE_DEPTH > budget {
+        return Err(anyhow::anyhow!(
+            "GPU {gpu_idx}: only {} MiB free; need ~{} MiB for {} at {size}x{size} with pipeline depth {PIPELINE_DEPTH}",
+            free_mem / (1024 * 1024),
+            (consumed + output_bytes * PIPELINE_DEPTH) / (1024 * 1024),
+            precision.name(),
+        ));
+    }
+
+    let set = build_descriptors(precision, size)?;
+
+    // PIPELINE_DEPTH independent streams + matching output buffers. We sync
+    // the oldest in-flight matmul and resubmit on its stream while the
+    // others continue to run, so the matrix cores stay fed across kernel
+    // boundaries.
+    let mut streams: Vec<Stream> = Vec::with_capacity(PIPELINE_DEPTH);
+    let mut outputs: Vec<DeviceBuffer> = Vec::with_capacity(PIPELINE_DEPTH);
+    for _ in 0..PIPELINE_DEPTH {
+        streams.push(Stream::new()?);
+        outputs.push(DeviceBuffer::alloc_filled(output_bytes, 0)?);
+    }
+
+    // Re-query the heuristic on *this* handle and burn with its first pick.
+    // The algo bytes can reference per-handle internal state (a kernel module
+    // loaded into the GPU context that owned the lookup), so the prewarm's algo
+    // isn't always portable; the call is fast once the comgr cache is hot. We
+    // intentionally do NOT time-and-pick among candidates here — see TUNE_ALGOS.
+    let algo = {
+        let mut algos = [sys::hipblasLtMatmulHeuristicResult_t::default(); 1];
+        let mut returned: i32 = 0;
+        {
+            // Mute the FP8 latency-table warning flood for the heuristic call;
+            // the global lock in StderrSilencer serializes this across GPUs.
+            let _silencer = (precision == Precision::Fp8)
+                .then(StderrSilencer::new)
+                .flatten();
+            unsafe {
+                lt_check(
+                    sys::hipblasLtMatmulAlgoGetHeuristic(
+                        set.handle.0,
+                        set.desc.0,
+                        set.a_layout.0,
+                        set.b_layout.0,
+                        set.cd_layout.0,
+                        set.cd_layout.0,
+                        set.pref.0,
+                        1,
+                        algos.as_mut_ptr(),
+                        &mut returned,
+                    ),
+                    "hipblasLtMatmulAlgoGetHeuristic (burn)",
+                )?;
             }
         }
-    }
-    Ok(temps)
-}
+        if returned < 1 {
+            return Err(anyhow::anyhow!(
+                "GPU #{gpu_idx}: no algorithm for {}",
+                precision.name()
+            ));
+        }
+        let _ = config.tuned_algo; // suppress unused warning
+        algos[0].algo
+    };
+    let alpha_f32: f32 = 1.0;
+    let beta_f32: f32 = 0.0;
 
-fn poll_throttling(
-    rocm_smi: &mut RocmSmiWrapper,
-    gpu_count: usize,
-) -> anyhow::Result<Vec<ThrottleStatus>> {
-    let mut throttling = vec![];
-    for i in 0..gpu_count {
-        match rocm_smi.get_throttle_status(i as u32) {
-            Ok(status) => throttling.push(status),
-            Err(_) => throttling.push(ThrottleStatus::default()),
+    let submit = |stream: &Stream, out: &DeviceBuffer| -> sys::hipblasStatus_t {
+        unsafe {
+            sys::hipblasLtMatmul(
+                set.handle.0,
+                set.desc.0,
+                &alpha_f32 as *const f32 as *const c_void,
+                set.a.as_ptr(),
+                set.a_layout.0,
+                set.b.as_ptr(),
+                set.b_layout.0,
+                &beta_f32 as *const f32 as *const c_void,
+                out.as_ptr(),
+                set.cd_layout.0,
+                out.as_ptr(),
+                set.cd_layout.0,
+                &algo,
+                set.workspace.as_ptr(),
+                WORKSPACE_BYTES,
+                stream.0,
+            )
+        }
+    };
+
+    // Quick per-thread warmup so per-stream lazy state is up before the
+    // measurement window opens. comgr cache is hot from prewarm so this is
+    // fast.
+    eprintln!("GPU #{gpu_idx}: warming up hipBLASLt ({})", precision.name());
+    for i in 0..PIPELINE_DEPTH {
+        let rc = submit(&streams[i], &outputs[i]);
+        if rc != sys::HIPBLAS_STATUS_SUCCESS {
+            return Err(anyhow::anyhow!("GPU #{gpu_idx}: warmup matmul status {rc}"));
         }
     }
-    Ok(throttling)
-}
+    for s in &streams {
+        s.sync()?;
+    }
+    eprintln!("GPU #{gpu_idx}: warmup complete");
 
-fn categorize_throttle_status(status: ThrottleStatus) -> (bool, bool, bool) {
-    let hw_throttling = status.power_throttling || status.current_throttling;
-    let thermal_sw = status.thermal_throttling;
-    let thermal_hw = false; // ROCm doesn't distinguish between SW/HW thermal throttling clearly
+    warmup_barrier.wait();
 
-    (hw_throttling, thermal_sw, thermal_hw)
-}
+    let mut error_count = 0;
+    const MAX_ERRORS: usize = 16;
 
-fn supports_bf16(gpu: &Arc<HipContext>) -> anyhow::Result<bool> {
-    let name = gpu.name().to_lowercase();
-
-    // Name-based detection for known BF16-supporting GPUs
-    if name.contains("mi300")
-        || name.contains("mi325")
-        || name.contains("mi250")
-        || name.contains("mi210")
-    {
-        return Ok(true);
+    // Prime the pipeline so all PIPELINE_DEPTH streams have an in-flight matmul.
+    for i in 0..PIPELINE_DEPTH {
+        if submit(&streams[i], &outputs[i]) != sys::HIPBLAS_STATUS_SUCCESS {
+            error_count += 1;
+        }
     }
 
-    Ok(false)
+    let mut next = 0usize;
+    while !stop.load(Relaxed) && error_count < MAX_ERRORS {
+        if let Err(e) = streams[next].sync() {
+            error_count += 1;
+            if error_count == 1 {
+                eprintln!("GPU #{gpu_idx}: stream sync failed: {e}");
+            }
+            continue;
+        }
+        let _ = tx.send((gpu_idx, 1));
+        let rc = submit(&streams[next], &outputs[next]);
+        if rc != sys::HIPBLAS_STATUS_SUCCESS {
+            error_count += 1;
+            if error_count == 1 {
+                eprintln!(
+                    "GPU #{gpu_idx}: hipblasLtMatmul status {rc} (suppressing further errors)"
+                );
+            }
+        }
+        next = (next + 1) % PIPELINE_DEPTH;
+    }
+
+    for s in &streams {
+        let _ = s.sync();
+    }
+    Ok(())
 }
 
-fn supports_fp8(_gpu: &Arc<HipContext>) -> anyhow::Result<bool> {
-    // TODO: add FP8 support
-    Ok(false)
-}
+// --- Progress / reporting -----------------------------------------------------
+
+// With the warmup barrier in place, every GPU enters the burn loop within a
+// few milliseconds of every other. We still skip 1 reporting tick to discard
+// the partial-second sample that straddles the barrier release.
+const PER_GPU_WARMUP_TICKS: u32 = 1;
 
 async fn report_progress(
     config: Config,
-    gpu_count: usize,
+    gpu_names: Vec<String>,
     mut rx: Receiver<(usize, usize)>,
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    gpus_healthy: Arc<std::sync::atomic::AtomicBool>,
+    stop: Arc<AtomicBool>,
+    gpus_healthy: Arc<AtomicBool>,
 ) {
+    use tokio::sync::mpsc::error::TryRecvError;
+    let gpu_count = gpu_names.len();
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut burn_results = (0..gpu_count).map(BurnResult::new).collect::<Vec<_>>();
-    let mut tick = 0;
-    // Try to initialize ROCm SMI safely
+    let mut nonzero_ticks = vec![0u32; gpu_count];
+    let mut burning = false;
+    let mut burn_seconds_left = config.duration_secs;
+    let flops_per_matmul = 2.0 * (config.size as f64).powi(3);
     let rocm_smi = match RocmSmiWrapper::new() {
         Ok(smi) => Some(Arc::new(Mutex::new(smi))),
         Err(e) => {
             eprintln!(
-                "Warning: Failed to initialize ROCm SMI: {e}. Temperature and throttling monitoring will be disabled."
+                "Warning: Failed to initialize ROCm SMI: {e}. Temperature monitoring disabled."
             );
             None
         }
     };
 
-    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+    let mut burn_channel_dead = false;
+    loop {
         interval.tick().await;
+        if stop.load(Relaxed) {
+            break;
+        }
         let mut nops = vec![0usize; gpu_count];
-
-        // Drain the channel to get the latest updates
-        while let Ok(ops) = rx.try_recv() {
-            nops[ops.0] += ops.1;
+        loop {
+            match rx.try_recv() {
+                Ok((idx, n)) => nops[idx] += n,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    burn_channel_dead = true;
+                    break;
+                }
+            }
+        }
+        for i in 0..gpu_count {
+            if nops[i] > 0 {
+                nonzero_ticks[i] += 1;
+            }
         }
 
-        for i in 0..gpu_count {
-            let flops = nops[i] * SIZE * SIZE * SIZE * 2;
-            print!("{} ({} Gflops/s) ", nops[i], flops / 1_000_000_000);
-            if i < gpu_count - 1 {
-                print!("");
-            } else {
-                print!("| ");
-            }
+        let phase = if burning {
+            format!(
+                "burn {:>3}/{}",
+                config.duration_secs - burn_seconds_left + 1,
+                config.duration_secs
+            )
+        } else {
+            "warmup".to_string()
+        };
 
-            if tick > 4 {
-                // Skip the first 6 ticks to avoid caches effects
+        let mut line = format!("[{phase}] ");
+        for i in 0..gpu_count {
+            let flops = nops[i] as f64 * flops_per_matmul;
+            line.push_str(&format_throughput(flops));
+            if i < gpu_count - 1 {
+                line.push_str(" | ");
+            }
+            if burning && nonzero_ticks[i] > PER_GPU_WARMUP_TICKS {
                 burn_results[i].flops_max = burn_results[i].flops_max.max(flops);
                 burn_results[i].flops_min = burn_results[i].flops_min.min(flops);
                 burn_results[i].flops_sum += flops;
@@ -954,114 +1164,97 @@ async fn report_progress(
             }
         }
 
-        // Report GPU temperatures if ROCm SMI is available
         if let Some(ref smi) = rocm_smi {
-            let mut smi = smi.lock().unwrap();
-            match poll_temperatures(&mut smi, gpu_count) {
-                Ok(temps) => {
-                    for i in 0..gpu_count {
-                        if temps[i] > 0 {
-                            print!("{}°C", temps[i]);
-                        } else {
-                            print!("N/A");
-                        }
-                        if i < gpu_count - 1 {
-                            print!(" ");
-                        } else {
-                            print!(" | ");
-                        }
-                        if tick > 4 && temps[i] > 0 {
-                            burn_results[i].temp_max = burn_results[i].temp_max.max(temps[i]);
-                            burn_results[i].temp_min = burn_results[i].temp_min.min(temps[i]);
-                            burn_results[i].temp_sum += temps[i];
+            let temps: Vec<Option<u32>> = {
+                let mut smi = smi.lock().unwrap();
+                (0..gpu_count)
+                    .map(|i| smi.get_temperature(i as u32).ok())
+                    .collect()
+            };
+            line.push_str(" || ");
+            for i in 0..gpu_count {
+                match temps[i] {
+                    Some(t) => {
+                        line.push_str(&format!("{t}°C"));
+                        if burning && nonzero_ticks[i] > PER_GPU_WARMUP_TICKS {
+                            burn_results[i].temp_max = burn_results[i].temp_max.max(t);
+                            burn_results[i].temp_min = burn_results[i].temp_min.min(t);
+                            burn_results[i].temp_sum += t as u64;
                             burn_results[i].temp_count += 1;
                         }
                     }
+                    None => line.push_str(" N/A"),
                 }
-                Err(_) => {
-                    print!("Temp read error | ");
+                if i < gpu_count - 1 {
+                    line.push(' ');
                 }
             }
+        }
 
-            // Report throttling
-            match poll_throttling(&mut smi, gpu_count) {
-                Ok(throttling) => {
-                    for i in 0..gpu_count {
-                        let (hw, thermal_sw, thermal_hw) =
-                            categorize_throttle_status(throttling[i]);
+        println!("{line}");
 
-                        if !hw && !thermal_sw && !thermal_hw {
-                            print!("");
-                        } else {
-                            let mut throttle_types = Vec::new();
-                            if thermal_sw {
-                                throttle_types.push("T");
-                                burn_results[i].throttling_thermal_sw += 1;
-                            }
-                            if thermal_hw {
-                                throttle_types.push("TH");
-                                burn_results[i].throttling_thermal_hw += 1;
-                            }
-                            if hw {
-                                throttle_types.push("P");
-                                burn_results[i].throttling_hw += 1;
-                            }
-                            print!("{}", throttle_types.join(","));
-                        }
-
-                        if i < gpu_count - 1 {
-                            print!(" ");
-                        } else {
-                            println!();
-                        }
-                    }
-                }
-                Err(_) => {
-                    println!("Throttling read error");
-                }
+        if !burning {
+            if nonzero_ticks.iter().all(|&n| n > PER_GPU_WARMUP_TICKS) {
+                burning = true;
+                println!(
+                    "Warmup complete. Burning all {gpu_count} GPUs for {}s...",
+                    config.duration_secs
+                );
+            } else if burn_channel_dead {
+                eprintln!("All burn threads exited before reaching steady state");
+                stop.store(true, Relaxed);
+                break;
             }
         } else {
-            println!("Temperature/throttling monitoring disabled");
+            burn_seconds_left = burn_seconds_left.saturating_sub(1);
+            if burn_seconds_left == 0 || burn_channel_dead {
+                stop.store(true, Relaxed);
+                break;
+            }
         }
-
-        tick += 1;
     }
 
-    // Final report
-    for r in burn_results.clone() {
-        println!(
-            "GPU #{}: {:6.0} Gflops/s (min: {:.2}, max: {:.2})",
-            r.gpu_idx,
-            r.flops_avg() / 1_000_000_000.0,
-            r.flops_min as f64 / 1_000_000_000.0,
-            r.flops_max as f64 / 1_000_000_000.0,
-        );
-
-        if r.temp_count > 0 && r.temp_sum > 0 {
+    println!();
+    for (i, r) in burn_results.iter().enumerate() {
+        if r.n_iters == 0 {
             println!(
-                "         Temperature: {:.1}°C (min: {:.1}, max: {:.1})",
+                "GPU #{}: no samples collected (burn never reached steady state)",
+                r.gpu_idx
+            );
+            continue;
+        }
+        let peak = peak_flops_per_sec(&gpu_names[i], config.precision);
+        let pct = peak.map(|p| 100.0 * r.flops_avg() / p);
+        match pct {
+            Some(pct) => println!(
+                "GPU #{}: avg {} (min {}, max {})  -  {:.1}% of peak {} ({})",
+                r.gpu_idx,
+                format_throughput(r.flops_avg()),
+                format_throughput(r.flops_min),
+                format_throughput(r.flops_max),
+                pct,
+                config.precision.name(),
+                format_throughput(peak.unwrap()),
+            ),
+            None => println!(
+                "GPU #{}: avg {} (min {}, max {})",
+                r.gpu_idx,
+                format_throughput(r.flops_avg()),
+                format_throughput(r.flops_min),
+                format_throughput(r.flops_max),
+            ),
+        }
+        if r.temp_count > 0 {
+            println!(
+                "         Temperature: avg {:.1}°C, min {}°C, max {}°C",
                 r.temp_avg(),
-                r.temp_min as f64,
-                r.temp_max as f64
-            );
-        }
-
-        if r.throttling_hw > 0 || r.throttling_thermal_sw > 0 || r.throttling_thermal_hw > 0 {
-            println!(
-                "         Throttling HW: {}, Thermal SW: {}, Thermal HW: {}",
-                r.throttling_hw > 0,
-                r.throttling_thermal_sw > 0,
-                r.throttling_thermal_hw > 0
+                r.temp_min,
+                r.temp_max
             );
         }
     }
 
-    let (healthy, reasons) = are_gpus_healthy(
-        burn_results,
-        config.tflops_tolerance,
-        config.tolerate_software_throttling,
-    );
-
+    let (healthy, reasons) = are_gpus_healthy(&burn_results, config.tflops_tolerance);
     if healthy {
         println!("All GPUs seem healthy");
     } else {
@@ -1070,121 +1263,55 @@ async fn report_progress(
             println!("  - {r}");
         }
     }
-
-    gpus_healthy.store(healthy, std::sync::atomic::Ordering::Relaxed);
+    gpus_healthy.store(healthy, Relaxed);
     println!("Freeing GPUs...");
 }
 
-fn are_gpus_healthy(
-    burn_results: Vec<BurnResult>,
-    tflops_tolerance: f64,
-    tolerate_software_throttling: bool,
-) -> (bool, Vec<String>) {
-    let mut reasons = vec![];
-    // acceptable_flops is tflops_tolerance% lower than best gpu avg flops
-    let acceptable_flops: f64 = burn_results
+fn format_throughput(flops_per_sec: f64) -> String {
+    let v = flops_per_sec;
+    if v >= 1e15 {
+        format!("{:6.2} PFLOP/s", v / 1e15)
+    } else if v >= 1e12 {
+        format!("{:6.2} TFLOP/s", v / 1e12)
+    } else if v >= 1e9 {
+        format!("{:6.2} GFLOP/s", v / 1e9)
+    } else if v >= 1e6 {
+        format!("{:6.2} MFLOP/s", v / 1e6)
+    } else {
+        format!("{v:6.0} FLOP/s")
+    }
+}
+
+fn are_gpus_healthy(burn_results: &[BurnResult], tflops_tolerance: f64) -> (bool, Vec<String>) {
+    let best_avg = burn_results
         .iter()
         .map(|r| r.flops_avg())
-        .fold(0., |max, avg| {
-            max.max(avg * (100. - tflops_tolerance) / 100.)
-        });
+        .fold(0f64, f64::max);
+    let acceptable = best_avg * (100. - tflops_tolerance) / 100.;
+    let mut reasons = vec![];
     for r in burn_results.iter() {
-        let mut low_flops = false;
-        if r.flops_avg() < acceptable_flops {
-            reasons.push(format!("GPU {} - ", r.gpu_idx) + GPU_FLOPS_REASON);
-            low_flops = true;
-        }
-        // if we have any throttling
-        if r.is_throttled() {
-            if !low_flops
-                && tolerate_software_throttling
-                && (r.throttling_thermal_hw == 0 && r.throttling_hw == 0)
-            {
-                continue;
-            }
-            reasons.push(format!("GPU {} - ", r.gpu_idx) + GPU_THROTTLING_REASON);
+        if r.flops_avg() < acceptable {
+            reasons.push(format!("GPU {} - {GPU_FLOPS_REASON}", r.gpu_idx));
         }
     }
     (reasons.is_empty(), reasons)
-}
-
-async fn burn_gpu<T: VariablePrecisionFloat>(
-    gpu_idx: usize,
-    gpu: Arc<HipContext>,
-    a: Vec<T>,
-    b: Vec<T>,
-    tx: Sender<(usize, usize)>,
-    stop: Arc<std::sync::atomic::AtomicBool>,
-) -> anyhow::Result<usize> {
-    gpu.set_current()?;
-    let (free_mem, _) = gpu.mem_get_info()?;
-    let mem_to_use = (free_mem as f64 * MEM_TO_USE_PCT) as usize;
-    let iters = (mem_to_use - 2 * SIZE * SIZE * std::mem::size_of::<T>())
-        / (SIZE * SIZE * std::mem::size_of::<T>());
-    let (a_gpu, b_gpu, mut out_slices_gpu) = alloc_buffers(&gpu, a, b, iters)?;
-    let handle = RocBlasHandle::new()?;
-    let mut i = 0;
-    let mut error_count = 0;
-    const MAX_ERRORS: usize = 10;
-
-    while !stop.load(std::sync::atomic::Ordering::Relaxed) && error_count < MAX_ERRORS {
-        for out in out_slices_gpu.iter_mut() {
-            match T::compute_gemm(&handle, &a_gpu, &b_gpu, out) {
-                Ok(_) => match gpu.synchronize() {
-                    Ok(_) => {
-                        i += 1;
-                        let _ = tx.send((gpu_idx, 1));
-                    }
-                    Err(_e) => {
-                        error_count += 1;
-                        break;
-                    }
-                },
-                Err(_e) => {
-                    error_count += 1;
-                    break;
-                }
-            }
-        }
-    }
-    Ok(i)
-}
-
-fn alloc_buffers<T: VariablePrecisionFloat>(
-    gpu: &Arc<HipContext>,
-    a: Vec<T>,
-    b: Vec<T>,
-    num_out_slices: usize,
-) -> anyhow::Result<AllocBufferTuple<T>> {
-    let a_gpu = gpu.htod_copy(a)?;
-    let b_gpu = gpu.htod_copy(b)?;
-
-    let mut out_slices = Vec::new();
-    for _i in 0..num_out_slices {
-        let out = gpu.alloc_zeros(SIZE * SIZE)?;
-        out_slices.push(out);
-    }
-
-    Ok((a_gpu, b_gpu, out_slices))
 }
 
 fn detect_gpus() -> anyhow::Result<Vec<Arc<HipContext>>> {
     let num_gpus = HipContext::device_count()? as usize;
     let mut devices = Vec::new();
     for i in 0..num_gpus {
-        let dev = Arc::new(HipContext::new(i as i32)?);
-        devices.push(dev);
+        devices.push(Arc::new(HipContext::new(i as i32)?));
     }
     Ok(devices)
 }
 
-async fn shutdown_signal(stop: Arc<std::sync::atomic::AtomicBool>) {
+async fn shutdown_signal(stop: Arc<AtomicBool>) {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
             .expect("failed to install Ctrl+C handler");
     };
-
     #[cfg(unix)]
     let terminate = async {
         signal::unix::signal(signal::unix::SignalKind::terminate())
@@ -1192,10 +1319,8 @@ async fn shutdown_signal(stop: Arc<std::sync::atomic::AtomicBool>) {
             .recv()
             .await;
     };
-
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
-
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
