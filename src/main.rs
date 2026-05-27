@@ -1390,7 +1390,10 @@ mod tests {
             Some(5.0 * 1e15)
         );
         // gfx942 (MI300X/MI325X) supports FP8 too.
-        assert!(precision_supported("amd radeon graphics gfx942", Precision::Fp8));
+        assert!(precision_supported(
+            "amd radeon graphics gfx942",
+            Precision::Fp8
+        ));
     }
 
     #[test]
@@ -1404,7 +1407,13 @@ mod tests {
 
     #[test]
     fn unknown_device_has_no_peak() {
-        assert_eq!(peak_flops_per_sec("some future gpu gfx9999", Precision::Fp8), None);
-        assert!(!precision_supported("some future gpu gfx9999", Precision::Fp8));
+        assert_eq!(
+            peak_flops_per_sec("some future gpu gfx9999", Precision::Fp8),
+            None
+        );
+        assert!(!precision_supported(
+            "some future gpu gfx9999",
+            Precision::Fp8
+        ));
     }
 }
