@@ -22,6 +22,10 @@ unsafe extern "C" {
     pub fn hipGetDeviceCount(count: *mut c_int) -> hipError_t;
     pub fn hipSetDevice(device_id: c_int) -> hipError_t;
     pub fn hipDeviceGetName(name: *mut c_char, len: c_int, device: c_int) -> hipError_t;
+    // ROCm 6+ entry point for hipGetDeviceProperties. We never model the large,
+    // version-specific hipDeviceProp_t struct; device_arch() hands this an
+    // oversized zeroed buffer and scans it for the gcnArchName string.
+    pub fn hipGetDevicePropertiesR0600(prop: *mut c_void, device: c_int) -> hipError_t;
     pub fn hipMalloc(ptr: *mut hipDeviceptr_t, size: usize) -> hipError_t;
     pub fn hipFree(ptr: hipDeviceptr_t) -> hipError_t;
     pub fn hipMemset(dest: hipDeviceptr_t, value: c_int, size_bytes: usize) -> hipError_t;
@@ -29,6 +33,30 @@ unsafe extern "C" {
     pub fn hipStreamSynchronize(stream: hipStream_t) -> hipError_t;
     pub fn hipStreamCreate(stream: *mut hipStream_t) -> hipError_t;
     pub fn hipStreamDestroy(stream: hipStream_t) -> hipError_t;
+}
+
+/// Return the GPU's ISA / gfx architecture (e.g. "gfx950"), or `None` on error.
+///
+/// Unlike the marketing name from `hipDeviceGetName` — which falls back to a
+/// generic "AMD Radeon Graphics" inside many containers — the gcnArchName is
+/// derived from the device ISA and is always resolvable. We avoid binding the
+/// large, ROCm-version-specific `hipDeviceProp_t` struct: instead we pass an
+/// oversized zeroed buffer and read the null-terminated "gfx…" token out of it
+/// (the gcnArchName field, e.g. "gfx950:sramecc+:xnack-"; we keep just "gfx950").
+pub fn device_arch(device_id: c_int) -> Option<String> {
+    const BUF_BYTES: usize = 8192; // comfortably larger than any hipDeviceProp_t
+    let mut buf = vec![0u8; BUF_BYTES];
+    let rc = unsafe { hipGetDevicePropertiesR0600(buf.as_mut_ptr() as *mut c_void, device_id) };
+    if rc != hipSuccess {
+        return None;
+    }
+    let start = buf.windows(3).position(|w| w == b"gfx")?;
+    let arch: String = buf[start..]
+        .iter()
+        .take_while(|&&c| c.is_ascii_alphanumeric())
+        .map(|&c| c as char)
+        .collect();
+    (arch.len() > 3).then_some(arch)
 }
 
 // --- hipBLAS / hipBLASLt ------------------------------------------------------

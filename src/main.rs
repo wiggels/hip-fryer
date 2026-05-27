@@ -310,6 +310,9 @@ impl Drop for DeviceBuffer {
 pub struct HipContext {
     device_id: i32,
     name: String,
+    /// ISA arch (e.g. "gfx950"). Resolvable even when `name` is the generic
+    /// "AMD Radeon Graphics" containers report; used as a peak-table fallback.
+    arch: Option<String>,
 }
 
 impl HipContext {
@@ -324,7 +327,12 @@ impl HipContext {
             let name = std::ffi::CStr::from_ptr(buf.as_ptr())
                 .to_string_lossy()
                 .into_owned();
-            Ok(HipContext { device_id, name })
+            let arch = sys::device_arch(device_id);
+            Ok(HipContext {
+                device_id,
+                name,
+                arch,
+            })
         }
     }
 
@@ -342,6 +350,19 @@ impl HipContext {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn arch(&self) -> Option<&str> {
+        self.arch.as_deref()
+    }
+
+    /// Lowercased string for peak-table matching: the marketing name plus the
+    /// ISA arch, so a generic "AMD Radeon Graphics" still matches on "gfx950".
+    pub fn match_key(&self) -> String {
+        match &self.arch {
+            Some(arch) => format!("{} {}", self.name.to_lowercase(), arch),
+            None => self.name.to_lowercase(),
+        }
     }
 
     pub fn set_current(&self) -> anyhow::Result<()> {
@@ -557,15 +578,17 @@ impl RocmSmiWrapper {
 
 // --- Peak throughput table ----------------------------------------------------
 
-/// Returns dense peak in FLOP/s for (gpu name, precision) or `None` if we don't
-/// have a published spec for the part.
-fn peak_flops_per_sec(gpu_name: &str, precision: Precision) -> Option<f64> {
-    let n = gpu_name.to_lowercase();
-    // Each tuple: (substring matching the device name, peak in PFLOP/s for each
-    // precision). Sourced from AMD product briefs (dense, no structured sparsity).
-    // MI355X numbers from the user-supplied datasheet.
+/// Returns dense peak in FLOP/s for (match key, precision) or `None` if we don't
+/// have a published spec for the part. `key` is `HipContext::match_key()` — the
+/// lowercased marketing name plus the ISA arch (e.g. "gfx950").
+fn peak_flops_per_sec(key: &str, precision: Precision) -> Option<f64> {
+    let n = key.to_lowercase();
+    // Each entry: marketing-name substring + ISA arch, and peak in PFLOP/s for
+    // each precision. Sourced from AMD product briefs (dense, no structured
+    // sparsity). MI355X numbers from the user-supplied datasheet.
     struct Spec {
         match_str: &'static str,
+        arch: &'static str,
         fp32: f64,
         bf16: f64,
         fp8: f64,
@@ -573,37 +596,49 @@ fn peak_flops_per_sec(gpu_name: &str, precision: Precision) -> Option<f64> {
     const SPECS: &[Spec] = &[
         Spec {
             match_str: "mi355",
+            arch: "gfx950",
             fp32: 0.1573,
             bf16: 2.5,
             fp8: 5.0,
         },
         Spec {
             match_str: "mi325",
+            arch: "gfx942",
             fp32: 0.1633,
             bf16: 2.6,
             fp8: 5.22,
         },
         Spec {
             match_str: "mi300x",
+            arch: "gfx942",
             fp32: 0.1633,
             bf16: 2.6,
             fp8: 5.22,
         },
         Spec {
             match_str: "mi250",
+            arch: "gfx90a",
             fp32: 0.0479,
             bf16: 0.383,
             fp8: 0.0,
         },
         Spec {
             match_str: "mi210",
+            arch: "gfx90a",
             fp32: 0.0226,
             bf16: 0.181,
             fp8: 0.0,
         },
     ];
 
-    let spec = SPECS.iter().find(|s| n.contains(s.match_str))?;
+    // Prefer the marketing-name match (exact per-SKU); fall back to the ISA arch
+    // when the name is unresolved (containers report "AMD Radeon Graphics").
+    // Arch is coarser — gfx942 maps MI300X≡MI325X (identical peaks) and gfx90a
+    // resolves to the first listed match — but it's enough to pick precision.
+    let spec = SPECS
+        .iter()
+        .find(|s| n.contains(s.match_str))
+        .or_else(|| SPECS.iter().find(|s| n.contains(s.arch)))?;
     let v = match precision {
         Precision::Fp32 => spec.fp32,
         Precision::Bf16 => spec.bf16,
@@ -612,8 +647,8 @@ fn peak_flops_per_sec(gpu_name: &str, precision: Precision) -> Option<f64> {
     if v > 0.0 { Some(v * 1e15) } else { None }
 }
 
-fn precision_supported(gpu_name: &str, precision: Precision) -> bool {
-    peak_flops_per_sec(gpu_name, precision)
+fn precision_supported(key: &str, precision: Precision) -> bool {
+    peak_flops_per_sec(key, precision)
         .map(|p| p > 0.0)
         .unwrap_or(false)
 }
@@ -621,7 +656,7 @@ fn precision_supported(gpu_name: &str, precision: Precision) -> bool {
 fn auto_precision(gpus: &[Arc<HipContext>]) -> Precision {
     // Prefer the highest-throughput format every GPU supports.
     for p in [Precision::Fp8, Precision::Bf16] {
-        if gpus.iter().all(|g| precision_supported(g.name(), p)) {
+        if gpus.iter().all(|g| precision_supported(&g.match_key(), p)) {
             return p;
         }
     }
@@ -660,17 +695,21 @@ async fn run(args: Args) -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("No GPUs detected"));
     }
     for gpu in &gpus {
-        println!("Detected GPU #{}: {}", gpu.ordinal(), gpu.name());
+        match gpu.arch() {
+            Some(arch) => println!("Detected GPU #{}: {} ({arch})", gpu.ordinal(), gpu.name()),
+            None => println!("Detected GPU #{}: {}", gpu.ordinal(), gpu.name()),
+        }
     }
 
     let precision = match args.precision {
         Some(p) => {
             for gpu in &gpus {
-                if !precision_supported(gpu.name(), p) {
+                if !precision_supported(&gpu.match_key(), p) {
                     return Err(anyhow::anyhow!(
-                        "Precision {} is not supported on {}",
+                        "Precision {} is not supported on {} ({})",
                         p.name(),
-                        gpu.name()
+                        gpu.name(),
+                        gpu.arch().unwrap_or("unknown arch"),
                     ));
                 }
             }
@@ -728,12 +767,14 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let gpus_healthy = Arc::new(AtomicBool::new(true));
     let gpus_healthy_clone = gpus_healthy.clone();
     let stop_clone = stop.clone();
-    let gpu_names: Vec<String> = gpus.iter().map(|g| g.name().to_string()).collect();
+    // Match keys (name + arch), not display names: report_progress uses these
+    // only for the peak-of-spec lookup, which must work on generic names too.
+    let gpu_keys: Vec<String> = gpus.iter().map(|g| g.match_key()).collect();
     let config_for_report = config.clone();
     let progress = tokio::spawn(async move {
         report_progress(
             config_for_report,
-            gpu_names,
+            gpu_keys,
             rx,
             stop_clone,
             gpus_healthy_clone,
@@ -1099,13 +1140,13 @@ const PER_GPU_WARMUP_TICKS: u32 = 1;
 
 async fn report_progress(
     config: Config,
-    gpu_names: Vec<String>,
+    gpu_keys: Vec<String>,
     mut rx: Receiver<(usize, usize)>,
     stop: Arc<AtomicBool>,
     gpus_healthy: Arc<AtomicBool>,
 ) {
     use tokio::sync::mpsc::error::TryRecvError;
-    let gpu_count = gpu_names.len();
+    let gpu_count = gpu_keys.len();
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut burn_results = (0..gpu_count).map(BurnResult::new).collect::<Vec<_>>();
     let mut nonzero_ticks = vec![0u32; gpu_count];
@@ -1229,7 +1270,7 @@ async fn report_progress(
             );
             continue;
         }
-        let peak = peak_flops_per_sec(&gpu_names[i], config.precision);
+        let peak = peak_flops_per_sec(&gpu_keys[i], config.precision);
         let pct = peak.map(|p| 100.0 * r.flops_avg() / p);
         match pct {
             Some(pct) => println!(
@@ -1332,4 +1373,38 @@ async fn shutdown_signal(stop: Arc<AtomicBool>) {
         _ = terminate => {},
     }
     stop.store(true, Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Containers report a generic "AMD Radeon Graphics" name; match_key() appends
+    // the ISA arch so the peak table still resolves. These guard that fallback.
+    #[test]
+    fn arch_fallback_resolves_when_name_is_generic() {
+        let generic = "amd radeon graphics gfx950";
+        assert!(precision_supported(generic, Precision::Fp8));
+        assert_eq!(
+            peak_flops_per_sec(generic, Precision::Fp8),
+            Some(5.0 * 1e15)
+        );
+        // gfx942 (MI300X/MI325X) supports FP8 too.
+        assert!(precision_supported("amd radeon graphics gfx942", Precision::Fp8));
+    }
+
+    #[test]
+    fn marketing_name_takes_priority_over_arch() {
+        // A resolved MI210 name must use MI210 numbers, not the first gfx90a spec.
+        assert_eq!(
+            peak_flops_per_sec("amd instinct mi210 gfx90a", Precision::Bf16),
+            Some(0.181 * 1e15)
+        );
+    }
+
+    #[test]
+    fn unknown_device_has_no_peak() {
+        assert_eq!(peak_flops_per_sec("some future gpu gfx9999", Precision::Fp8), None);
+        assert!(!precision_supported("some future gpu gfx9999", Precision::Fp8));
+    }
 }
